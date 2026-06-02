@@ -1,63 +1,80 @@
-# Selective push — come pubblicare solo i file modificati
+# Push asset — pubblicare i file del funnel via MCP
 
-Regola: **non fare mai un push completo**. Rischi di sovrascrivere file di altri template o di azzerare lavoro non sincronizzato. Usa sempre `--only` per pubblicare solo i file che hai effettivamente toccato.
+Gen-2: tutti i push passano dal tool MCP `mcp__working_suite_shopify_admin__push_theme_asset`. NESSUN Shopify CLI, NESSUN `.env`, NESSUN token Theme Access, NESSUN prompt token in chat. Lo store è già connesso (Custom App, stesso Admin token dell'Analytics), decifrato lato-app dal tool MCP; la skill usa SOLO `store_id` dal contesto di sessione.
 
-## Comando standard
+Regola: pubblica **solo i file che hai effettivamente toccato**, indicati per **chiave esatta**. Mai glob, mai wildcard, mai un push dell'intero tema.
 
-```bash
-cd "<workdir-path>"
-set -a; source "<env-path>"; set +a
-npx @shopify/cli@latest theme push \
-  --theme <THEME_ID> \
-  --nodelete \
-  --allow-live \
-  --only "sections/<file1>.liquid" \
-  --only "sections/<file2>.liquid" \
-  --only "templates/product.<nome>.json"
+## Prerequisiti (dal contesto di sessione)
+
+- `store_id` — l'UUID `workspace_stores` salvato in Fase 1.
+- `theme_id` — il `main_theme_id` restituito da `mcp__working_suite_shopify_admin__check_connection` in Fase 2 (tema pubblicato/live). Non esiste più alcun elenco temi.
+
+Se i tool `mcp__working_suite_shopify_admin__*` non sono disponibili (mcp=no) → STOP: "MCP non configurato per questa sessione; riapri la chat builder." NON fare fallback a curl/CLI.
+
+## Chiamata standard
+
+```
+mcp__working_suite_shopify_admin__push_theme_asset {
+  store_id: <UUID workspace_stores>,
+  theme_id: <main_theme_id>,
+  assets: [
+    { key: "templates/page.<nome>.json",          content: "<contenuto completo del file>" },
+    { key: "sections/<prefisso><NN>-<role>.liquid", content: "<contenuto completo del file>" }
+  ]
+}
 ```
 
-## Flag spiegate
-
-- `--theme <ID>`: theme ID numerico del tema target (preso da `stores.json` per lo store corrente). Evita ambiguità se lo store ha più temi.
-- `--nodelete`: NON cancella file remoti che non esistono localmente. **Sempre presente.** Senza questo flag, un push selettivo potrebbe rompere altri template che non hai in locale.
-- `--allow-live`: permette di pushare sul tema pubblicato (il tema live dello store). Senza, Shopify CLI blocca il push per sicurezza. Usalo solo quando sei sicuro.
-- `--only "<path>"`: include solo quel file nel push. Ripetibile per più file.
+- `assets[]` — una entry per file. Una sola chiamata può contenere **fino a 50 asset** (batch). Se ne servono di più, spezza in più chiamate.
+- `key` — la **chiave esatta** dell'asset nel tema. Forme valide:
+  - `sections/<file>.liquid`
+  - `templates/page.<nome>.json`
+  - `layout/<nome>.liquid` (es. un layout chromeless custom)
+  - `snippets/<nome>.liquid`
+- `content` — il contenuto **integrale** del file generato dalla skill. La skill è la source of truth: niente pull, niente merge lato remoto.
 
 ## Pattern per tipo di cambiamento
 
 ### Hai modificato UNA sezione
-```bash
---only "sections/<prefisso>-<suffix>.liquid"
+```
+assets: [ { key: "sections/<prefisso><NN>-<role>.liquid", content: "<...>" } ]
 ```
 
 ### Hai creato un template nuovo + sezioni nuove
-```bash
---only "templates/product.<nome>.json" \
---only "sections/<prefisso>-01.liquid" \
---only "sections/<prefisso>-02.liquid" \
-# ... ripeti per tutte le sezioni duplicate
+```
+assets: [
+  { key: "templates/page.<nome>.json",          content: "<...>" },
+  { key: "sections/<prefisso>01-hero.liquid",    content: "<...>" },
+  { key: "sections/<prefisso>02-problem.liquid", content: "<...>" }
+  // ... una entry per ogni sezione
+]
 ```
 
-### Hai modificato un snippet condiviso
-```bash
---only "snippets/<nome-snippet>.liquid"
+### Hai creato un layout chromeless custom
+```
+assets: [
+  { key: "layout/<nome>.liquid",         content: "<...>" },
+  { key: "templates/page.<nome>.json",   content: "<...>" }
+]
 ```
 
-**Attenzione**: se modifichi un snippet usato anche da altri template (es. berberina vs crema-occhiaie), il cambio impatta anche quelli. Duplica il snippet con un nuovo nome se vuoi isolare.
+## Retry sugli errori transitori
+
+`push_theme_asset` può fallire per `429` / `502` / `503` / `504` (transitori). Ri-invoca la **stessa** chiamata con gli **stessi** argomenti fino a 3 tentativi, backoff 10s → 20s → 40s.
+
+## Quando NON fare retry (segnala subito)
+
+- `401` / `403` → `check_connection` non più valida → STOP, manda l'utente a `/configurations/stores` a (ri)connettere la Custom App. (NON "rigenera token".)
+- `Liquid syntax error` / errore di validazione asset → il file è rotto, NON è stato pubblicato. Correggi il `content` e ripeti.
+- `Theme not found` / `404` sul `theme_id` → ri-esegui `check_connection` per ottenere il nuovo `main_theme_id`.
+- `404` / chiave non valida su un asset → `key` errata. Fixa il path esatto.
 
 ## Cosa NON fare
 
-- ❌ `theme push` senza `--only` → push completo, rischio di sovrascrivere.
-- ❌ `theme push --only "sections/*"` → glob pattern, include TUTTE le sezioni (anche quelle non toccate).
-- ❌ Push diretto a `main` theme senza `--allow-live` non previsto dallo script.
-- ❌ Omettere `--nodelete` → può cancellare file remoti non presenti in locale.
+- ❌ Shopify CLI (`@shopify/cli theme push/pull/list`) — eliminato in Gen-2.
+- ❌ Glob/wildcard nelle `key` (es. `sections/*`) — sempre chiavi esatte.
+- ❌ `.env`, `SHOPIFY_CLI_THEME_TOKEN`, token Theme Access — non esistono più.
+- ❌ Fallback a `curl` verso l'Admin API — usa il tool MCP.
 
-## Verifica dopo il push
+## Lettura di un asset esistente
 
-Output atteso:
-```
-╭─ success ─...
-│  The theme '<NOME TEMA>' (#<THEME_ID>) was pushed successfully.
-```
-
-Se ricevi un errore di validazione Liquid, il file NON è stato pushato. Correggi il Liquid e rilancia. Shopify valida ogni file prima di applicarlo.
+Gen-2 non fa pull di una copia di lavoro. Se proprio serve leggere un singolo asset già presente sul tema, serve un tool Admin-API GET dedicato — NON usare la CLI.

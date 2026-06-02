@@ -270,7 +270,7 @@ Quando crei sezioni quiz, lo schema `{% schema %}` di OGNI step deve avere:
 
 Quando finisci una sezione strumentata:
 
-1. Pull preview theme con `?preview_theme_id=...`
+1. Dopo il push via `push_theme_asset`, apri l'URL live della PDP (`https://<store.shopify_domain>/products/<product.slug>`)
 2. Apri DevTools → Network → filtra per `ingest`
 3. Naviga la sezione (scroll su step, click su risposta, click su CTA)
 4. Verifica che la request a `/api/webhooks/ingest` contenga gli event corretti col payload pieno

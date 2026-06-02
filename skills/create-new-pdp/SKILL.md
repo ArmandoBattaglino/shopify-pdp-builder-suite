@@ -60,51 +60,47 @@ Esempi di risposte CORRETTE dopo aver ricevuto un input utente:
 | "no scegli tu"                | "L'utente ha annullato la domanda."                 | (nuovo AskUserQuestion con le stesse opzioni o conferma di proseguire con default) |
 | "torna indietro"              | "Operazione interrotta — riprendiamo dal precedente." | (nuovo AskUserQuestion con conferma di tornare alla fase precedente)              |
 
-### Push selettivo (template di comando — riusalo ovunque)
+### Push selettivo (template — riusalo ovunque)
 
-```bash
-cd "$STORE_WORKDIR"
-set -a; source "$STORE_ENV"; set +a
-npx @shopify/cli@latest theme push \
-  --theme "$STORE_THEME_ID" --nodelete --allow-live \
-  --only "<file1>" --only "<file2>" ...
+Il push avviene via MCP, mai via CLI. Chiama `mcp__working_suite_shopify_admin__push_theme_asset` passando lo `store_id` dal contesto di sessione e il `theme_id` = `main_theme_id` risolto in Fase 2 da `check_connection`:
+
+```
+mcp__working_suite_shopify_admin__push_theme_asset({
+  store_id: <workspace_stores UUID dal contesto>,
+  theme_id: <main_theme_id>,
+  assets: [
+    { key: "templates/product.<nome>.json", content: "<contenuto completo del file>" },
+    { key: "sections/<prefisso>-NN-....liquid", content: "<contenuto completo del file>" }
+  ]
+})
 ```
 
-Mai `theme push` senza `--only`. Il `--only` include SOLO i file del nuovo prefisso (template + sezioni duplicate).
+Regole:
+- **Chiavi esatte, mai glob.** Ogni `key` è il path esatto dell'asset (`sections/<prefisso>-NN-...liquid` oppure `templates/product.<slug>.json`). Includi SOLO i file del nuovo prefisso (template + sezioni duplicate), mai sezioni/template di altri prodotti.
+- `content` è il contenuto **completo** del file (non un diff). Una `key` per asset.
+- Una chiamata per asset, oppure un'unica chiamata con `assets[]` batchato (**max 50** per chiamata).
+- `theme_id` è sempre `main_theme_id` (il tema live/pubblicato) restituito da `check_connection`.
 
-### Errori transitori CLI Shopify (retry obbligatorio)
+### Errori transitori MCP push (retry obbligatorio)
 
-Shopify CLI fallisce a volte per cause **transitorie** (non per errore tuo): `502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway Timeout`, `ETIMEDOUT`, `ECONNRESET`, `socket hang up`, `network error`. Sono normali — succede sotto carico o per blip di rete.
+`push_theme_asset` può fallire a volte per cause **transitorie** (non per errore tuo): `429 Too Many Requests`, `502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway Timeout`, errori di rete/timeout lato Admin API. Sono normali — succede sotto carico o per blip di rete.
 
-**Comportamento richiesto**: non fermarti al primo fallimento. Fai **fino a 3 tentativi** con backoff esponenziale.
+**Comportamento richiesto**: non fermarti al primo fallimento. Fai **fino a 3 tentativi** con backoff: 10s → 20s → 40s.
 
-Pattern:
-```bash
-for attempt in 1 2 3; do
-  cd "$STORE_WORKDIR"
-  set -a; source "$STORE_ENV"; set +a
-  if npx @shopify/cli@latest theme push --theme "$STORE_THEME_ID" --nodelete --allow-live --only "<file>"; then
-    break
-  fi
-  exit_code=$?
-  if [ $attempt -lt 3 ]; then
-    sleep_secs=$((attempt * 10))   # 10s, poi 20s, poi 30s
-    echo "Tentativo $attempt fallito, ritento fra ${sleep_secs}s..."
-    sleep $sleep_secs
-  else
-    echo "Push fallito dopo 3 tentativi (exit=$exit_code)"
-    exit $exit_code
-  fi
-done
-```
+Pattern (logico):
+1. Tentativo 1 → se errore transitorio (429/502/503/504/network), attendi 10s.
+2. Tentativo 2 → se ancora transitorio, attendi 20s.
+3. Tentativo 3 → se ancora transitorio, attendi 40s e, se fallisce di nuovo, segnala all'utente.
+
+Ogni tentativo è una nuova chiamata `mcp__working_suite_shopify_admin__push_theme_asset` con gli stessi `{ store_id, theme_id, assets }`.
 
 **Quando NON fare retry** (errori NON transitori — fallimento immediato e segnala all'utente):
-- `401 Unauthorized` / `Invalid API key` / `403 Forbidden` → token scaduto/revocato. Stop, rimanda l'utente a Configurazioni → Store.
+- `401 Unauthorized` / `403 Forbidden` → la connessione Admin non è valida → `check_connection` è fallita. Stop, rimanda l'utente a **/configurations/stores** a (ri)connettere la Custom App. (NON "rigenera token".)
 - `Liquid syntax error` / `Invalid Liquid` → la modifica è rotta. Stop, leggi il file, fixa, ripeti.
-- `Theme not found` / `404` su `--theme <id>` → l'ID tema non esiste più (cancellato). Stop, ricostruisci la lista temi.
-- `404` su `--only "<file>"` → il file non esiste sul disco. Stop, fixa il path.
+- `Theme not found` / `404` su `theme_id` → il `main_theme_id` non è più valido. Stop, ri-esegui `check_connection` per risolvere il tema corrente.
+- `404` / asset key non valida → la `key` non corrisponde a un asset gestibile. Stop, fixa la chiave esatta.
 
-In modalità manutenzione (post-launch), applica lo stesso retry su `theme push` puntuali e su `theme pull`. Tenere `theme list` non in retry: l'errore lì è quasi sempre auth.
+In modalità manutenzione (post-launch), applica lo stesso retry sulle chiamate `push_theme_asset` puntuali.
 
 ### Regole di intoccabilità
 
@@ -120,10 +116,12 @@ Sotto WSA — riconoscibile da `$WSA_INTERNAL_KEY` valorizzato — il wrapper ti
 
 - **cwd**: `~/Desktop/shopify-pdp-builder/` (plugin skin per-workspace).
 - **`config/stores.json`**: SEMPRE in `./config/stores.json` (relativo al cwd). Read diretto, niente fallback.
-- **`.env` di ogni store**: già scritto dal wrapper con il Theme Access token salvato dall'operatore in **Configurazioni → Store → Credenziali**. **Non chiedere mai il token in chat.**
-- **Stores mancanti**: lo `stores.json` è in **sola lettura** sotto WSA (rigenerato a ogni init). Se serve uno store non in lista, rimanda l'operatore a Configurazioni → Store nella dashboard, poi ricaricare la chat.
+- **Connessione store**: lo store è già connesso (Custom App, stesso Admin token dell'Analytics), decifrato lato-app dal tool MCP; la skill usa SOLO lo `store_id` (UUID `workspace_stores`) dal contesto di sessione. **NESSUN `.env`, NESSUN token Theme Access, NESSUN prompt token in chat.**
+- **Stores mancanti**: lo `stores.json` è in **sola lettura** sotto WSA (rigenerato a ogni init). Se serve uno store non in lista, rimanda l'operatore a **/configurations/stores** nella dashboard a connettere la Custom App, poi ricaricare la chat.
 
-In modalità manuale (claude lanciato direttamente, no `$WSA_INTERNAL_KEY`): puoi chiedere il token in chat e scrivere `.env` inline. Pattern + sezione "Come generare un nuovo Theme Access token" in `references/auth-pattern.md`.
+### MCP guard (priorità massima)
+
+Tutte le operazioni sul tema passano dai tool `mcp__working_suite_shopify_admin__*` (`check_connection`, `push_theme_asset`). Se questi tool **non sono disponibili** nella sessione (mcp=no) → **STOP** con: "MCP non configurato per questa sessione; riapri la chat builder." **NON** fare fallback a `curl`/CLI Shopify.
 
 ---
 
@@ -133,35 +131,22 @@ In modalità manuale (claude lanciato direttamente, no `$WSA_INTERNAL_KEY`): puo
 
 `Read config/stores.json` (path relativo al cwd). Mostra la lista all'utente via `AskUserQuestion` — una opzione per store, niente "Altro" sotto WSA.
 
-Salva i campi dello store scelto in memoria: `store.name`, `store.shopify_domain`, `store.theme_id`, `store.workdir_path`, `store.env_path`.
+Salva i campi dello store scelto in memoria: `store.name`, `store.shopify_domain`, e soprattutto `store.store_id` (l'UUID `workspace_stores` dello store scelto — è la chiave che passi a TUTTI i tool MCP). Il `theme_id` NON viene preso da qui: si risolve in Fase 2 dal `main_theme_id` di `check_connection`.
 
 ---
 
-## Fase 2 — Verifica auth + scelta tema
+## Fase 2 — Verifica connessione + risoluzione tema
 
 🏷️ Prima riga: `<wsa-phase id="auth-check" />`
 
-1. Verifica che `store.env_path` esista e contenga `SHOPIFY_CLI_THEME_TOKEN=` non vuoto. Se vuoto sotto WSA: di' all'utente di aggiungere il token in Configurazioni → Store e ricaricare. Stop.
-2. Elenca i temi:
-   ```bash
-   cd "<store.workdir_path>"
-   set -a; source "<store.env_path>"; set +a
-   npx @shopify/cli@latest theme list --no-color
+1. **Verifica connessione** — chiama:
    ```
-   Se l'output mostra `401` / `Invalid API key`: token scaduto. Rimanda l'utente a rigenerarlo.
-3. Mostra i temi parsati con il flag `[live]` evidenziato:
+   mcp__working_suite_shopify_admin__check_connection({ store_id: <store.store_id dal contesto, salvato in Fase 1> })
    ```
-   • [live] <Nome>  (id: <ID>)
-   • [unpublished] <Nome>  (id: <ID>)
-   ```
-4. `AskUserQuestion`: tema su cui operare? Default proposto: `[live]` (o `store.theme_id` da config). Una opzione per tema.
-5. Salva la scelta in `store.theme_id` + `store.theme_name`.
-6. **Pull fresco del tema scelto** (chiedi conferma prima — il pull sovrascrive file locali non pushati):
-   ```bash
-   cd "<store.workdir_path>"
-   set -a; source "<store.env_path>"; set +a
-   npx @shopify/cli@latest theme pull --theme <store.theme_id> --nodelete
-   ```
+   - Se il risultato **non è connesso** → **STOP** con: "Connessione Shopify Admin non valida per questo store. Vai su /configurations/stores e (ri)connetti la Custom App." Non procedere oltre.
+2. **Risolvi il tema** dal risultato: il campo `main_theme_id` è il tema **pubblicato/live**. Salvalo in `store.theme_id` — è il `theme_id` che userai per TUTTI i push.
+   - Se `main_theme_id` è `null` → **STOP**: "Tema principale non risolto."
+   - Non esiste più alcun `theme list`: il tema su cui operi è sempre il main/live restituito da `check_connection`.
 
 ---
 
@@ -178,8 +163,10 @@ Vincoli: kebab-case, solo `[a-z0-9-]`, esempi `crema-borse-occhiaie-pdp`, `siero
 ### 3.2 Template base
 
 ```bash
-ls "<store.workdir_path>/templates/" | grep '^product\..*\.json$'
+ls templates/ | grep '^product\..*\.json$'
 ```
+
+(`templates/` è relativo al cwd `~/Desktop/shopify-pdp-builder/`, come `config/stores.json`.)
 
 `AskUserQuestion` con una opzione per template trovato. Se ne esiste uno solo oltre al default `product.json`, assumi quello senza chiedere.
 
@@ -228,7 +215,7 @@ Per ogni file duplicato:
 
 ### 3.6 Push iniziale
 
-Push selettivo con `--only` per template + tutte le sezioni duplicate (vedi convenzioni).
+Push selettivo via `push_theme_asset` (vedi convenzioni): un'unica chiamata MCP con `assets[]` contenente il template `templates/product.<nome>.json` + tutte le sezioni duplicate `sections/<prefisso>-NN-...liquid` (chiavi esatte, contenuto completo di ogni file, max 50 asset per chiamata). `theme_id` = `store.theme_id` (il `main_theme_id` risolto in Fase 2).
 
 ### 3.7 Creazione Product in Shopify Admin
 
@@ -359,7 +346,7 @@ Per ogni sezione con `image_picker`:
    ```
 3. Istruzioni:
    ```
-   1. Admin → Online Store → Themes → Customize (<store.theme_name>)
+   1. Admin → Online Store → Themes → Customize (tema live)
    2. Top-left picker → Products → <prodotto>
    3. Seleziona la sezione → click sul campo immagine → Upload → Save
    ```
@@ -443,7 +430,7 @@ Al resume di una sessione (`claude --resume <id>`), il transcript precedente con
 1. Chiedi all'operatore **cosa esattamente** vuole cambiare (e in quale sezione se non chiaro).
 2. Se non sai a quale file appartiene la modifica, fai un grep mirato per identificarla — NON rifare la lista template/sezioni come in Fase 3.
 3. Applica il fix puntuale: `Edit` o `python3 heredoc` sul singolo file.
-4. **Push selettivo** del solo file modificato (vedi convenzioni). Non pullare il tema intero a meno che l'operatore segnali divergenze sospette.
+4. **Push selettivo** del solo file modificato via `push_theme_asset` (vedi convenzioni). Il contenuto generato dalla skill è la fonte di verità: non c'è alcun pull del tema.
 5. Chiedi all'operatore di verificare sull'URL live.
 6. Quando confermato: `AskUserQuestion` "Altre modifiche?" con opzioni:
    - **Sì, ne ho un'altra** → torna alla scelta macro-categoria
@@ -451,8 +438,8 @@ Al resume di una sessione (`claude --resume <id>`), il transcript precedente con
 
 **Cosa NON fare in modalità manutenzione:**
 
-- Non ripercorrere le fasi 1-7 (store già scelto, tema già selezionato, template già duplicato, ecc.). Tutti questi dati sono già in memoria via `--resume`.
-- Non rifare il `theme pull` se non c'è una buona ragione (divergenza segnalata, file sembra obsoleto).
+- Non ripercorrere le fasi 1-7 (store già scelto, tema già risolto, template già duplicato, ecc.). Tutti questi dati sono già in memoria via `--resume`.
+- Non c'è alcun pull del tema: Gen-2 non scarica una copia di lavoro, il contenuto generato dalla skill è la fonte di verità.
 - Non riproporre la modalità sezione-per-sezione vs batch — per un fix singolo si fa direttamente puntuale.
 - Non emettere nuovi tag `<wsa-phase>` per fasi che hai già completato — confonderebbe la roadmap.
 
@@ -475,8 +462,7 @@ Reference: `references/analytics-instrumentation.md` (event catalog completo, pa
 ## References
 
 - `workflow-faithful-rebuild.md` — regola d'oro + tecniche sostituzione + form Katching
-- `auth-pattern.md` — Theme Access token, modalità manuale
-- `selective-push.md` — comando push completo
+- `selective-push.md` — come pubblicare gli asset via `push_theme_asset` (MCP)
 - `section-naming.md` — convenzioni prefissi
 - `image-specs-per-section.md` — dimensioni/ratio per ruolo sezione
 - `section-schema-patterns.md` — liquidify, setting types, edge case
@@ -486,8 +472,11 @@ Reference: `references/analytics-instrumentation.md` (event catalog completo, pa
 
 | Sintomo                          | Causa                                  | Fix                                                  |
 | -------------------------------- | -------------------------------------- | ---------------------------------------------------- |
-| `theme list` ritorna 401         | Token scaduto/revocato                 | Operatore rigenera in Configurazioni → Store         |
+| `check_connection` non connesso / push 401/403 | Custom App non connessa / Admin token non valido | Operatore (ri)connette la Custom App su /configurations/stores |
+| `check_connection` con `main_theme_id` null | Tema principale non risolto      | STOP: tema principale non risolto; operatore verifica il tema live |
+| Tool `mcp__working_suite_shopify_admin__*` assenti | MCP non configurato per la sessione | STOP: riapri la chat builder (no fallback CLI/curl)  |
 | Push fallisce "Liquid syntax"    | Sostituzione ha rotto Liquid           | Read file, localizza errore, Edit per riparare       |
+| Push fallisce 429/502/503/504    | Errore transitorio Admin API           | Retry con backoff 10s/20s/40s (3 tentativi)          |
 | Sezione non appare su PDP live   | Template JSON o sezione non pushata    | Verifica `templates/product.<nome>.json` + push      |
 | Stile diverso dall'originale     | Hash legacy toccato per errore         | Ripristina file originale + rifai solo testi schema  |
 | Product non usa il nuovo template| Template suffix non selezionato        | Admin → Product → Theme template → seleziona         |

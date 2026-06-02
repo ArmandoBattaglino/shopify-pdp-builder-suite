@@ -1,63 +1,70 @@
-# Selective push — come pubblicare solo i file modificati
+# Push selettivo — pubblicare solo i file modificati via MCP
 
-Regola: **non fare mai un push completo**. Rischi di sovrascrivere file di altri template o di azzerare lavoro non sincronizzato. Usa sempre `--only` per pubblicare solo i file che hai effettivamente toccato.
+Regola: **non fare mai un push completo**, e mai usare la CLI Shopify. Il push avviene esclusivamente con il tool MCP `mcp__working_suite_shopify_admin__push_theme_asset`, una `key` esatta per asset (mai glob). Includi SOLO i file che hai effettivamente toccato (template + sezioni del nuovo prefisso), mai asset di altri prodotti/template.
 
-## Comando standard
+## Chiamata standard
 
-```bash
-cd "<workdir-path>"
-set -a; source "<env-path>"; set +a
-npx @shopify/cli@latest theme push \
-  --theme <THEME_ID> \
-  --nodelete \
-  --allow-live \
-  --only "sections/<file1>.liquid" \
-  --only "sections/<file2>.liquid" \
-  --only "templates/product.<nome>.json"
+```
+mcp__working_suite_shopify_admin__push_theme_asset({
+  store_id: <UUID workspace_stores dal contesto di sessione>,
+  theme_id: <main_theme_id risolto da check_connection in Fase 2>,
+  assets: [
+    { key: "sections/<prefisso>-NN-...liquid", content: "<contenuto completo del file>" },
+    { key: "templates/product.<nome>.json",    content: "<contenuto completo del file>" }
+  ]
+})
 ```
 
-## Flag spiegate
+## Parametri
 
-- `--theme <ID>`: theme ID numerico del tema target (preso da `stores.json` per lo store corrente). Evita ambiguità se lo store ha più temi.
-- `--nodelete`: NON cancella file remoti che non esistono localmente. **Sempre presente.** Senza questo flag, un push selettivo potrebbe rompere altri template che non hai in locale.
-- `--allow-live`: permette di pushare sul tema pubblicato (il tema live dello store). Senza, Shopify CLI blocca il push per sicurezza. Usalo solo quando sei sicuro.
-- `--only "<path>"`: include solo quel file nel push. Ripetibile per più file.
+- `store_id`: l'UUID dello store in `workspace_stores`, preso dal contesto di sessione (salvato in Fase 1). È la chiave con cui il tool decifra lato-app l'Admin token (stesso token dell'Analytics, Custom App). NESSUN `.env`, NESSUN Theme Access token.
+- `theme_id`: sempre il `main_theme_id` (tema pubblicato/live) restituito da `check_connection` in Fase 2. Non esiste più alcun elenco temi: il target è sempre il main/live.
+- `assets[]`: array di `{ key, content }`.
+  - `key`: il path **esatto** dell'asset (`sections/<file>.liquid` oppure `templates/product.<nome>.json`). Mai un glob, mai una wildcard.
+  - `content`: il contenuto **completo** del file (non un diff).
+  - Una `key` per asset; puoi batchare più asset in un'unica chiamata, **max 50** per chiamata.
 
 ## Pattern per tipo di cambiamento
 
 ### Hai modificato UNA sezione
-```bash
---only "sections/<prefisso>-<suffix>.liquid"
+```
+assets: [ { key: "sections/<prefisso>-<suffix>.liquid", content: "..." } ]
 ```
 
 ### Hai creato un template nuovo + sezioni nuove
-```bash
---only "templates/product.<nome>.json" \
---only "sections/<prefisso>-01.liquid" \
---only "sections/<prefisso>-02.liquid" \
-# ... ripeti per tutte le sezioni duplicate
+```
+assets: [
+  { key: "templates/product.<nome>.json", content: "..." },
+  { key: "sections/<prefisso>-01.liquid", content: "..." },
+  { key: "sections/<prefisso>-02.liquid", content: "..." }
+  // ... una entry per ogni sezione duplicata (max 50 per chiamata)
+]
 ```
 
-### Hai modificato un snippet condiviso
-```bash
---only "snippets/<nome-snippet>.liquid"
+### Hai modificato uno snippet condiviso
+```
+assets: [ { key: "snippets/<nome-snippet>.liquid", content: "..." } ]
 ```
 
-**Attenzione**: se modifichi un snippet usato anche da altri template (es. berberina vs crema-occhiaie), il cambio impatta anche quelli. Duplica il snippet con un nuovo nome se vuoi isolare.
+**Attenzione**: se modifichi uno snippet usato anche da altri template (es. berberina vs crema-occhiaie), il cambio impatta anche quelli. Duplica lo snippet con un nuovo nome se vuoi isolare.
 
 ## Cosa NON fare
 
-- ❌ `theme push` senza `--only` → push completo, rischio di sovrascrivere.
-- ❌ `theme push --only "sections/*"` → glob pattern, include TUTTE le sezioni (anche quelle non toccate).
-- ❌ Push diretto a `main` theme senza `--allow-live` non previsto dallo script.
-- ❌ Omettere `--nodelete` → può cancellare file remoti non presenti in locale.
+- ❌ Glob/wildcard nelle `key` (es. `sections/*`). Solo path esatti, uno per asset.
+- ❌ Mandare un diff invece del contenuto completo del file.
+- ❌ Pushare asset che non hai toccato (rischio di sovrascrivere lavoro altrui o template di altri prodotti).
+- ❌ Fallback a `curl`/CLI Shopify se il tool MCP fallisce o è assente. Se i tool `mcp__working_suite_shopify_admin__*` non sono disponibili → STOP e riapri la chat builder.
+
+## Retry su errori transitori
+
+`push_theme_asset` può fallire per cause transitorie: `429`, `502`, `503`, `504`, errori di rete/timeout. In questi casi ritenta con backoff **10s → 20s → 40s** (fino a 3 tentativi), ripetendo la stessa chiamata.
+
+Errori NON transitori (stop immediato, niente retry):
+- `401` / `403` → connessione Admin non valida (`check_connection` fallita). Rimanda l'utente a /configurations/stores a (ri)connettere la Custom App.
+- `Liquid syntax error` / `Invalid Liquid` → la modifica è rotta. Correggi il file e ripeti.
+- `404` su `theme_id` → il `main_theme_id` non è più valido. Ri-esegui `check_connection`.
+- `key` non valida → fixa la chiave esatta dell'asset.
 
 ## Verifica dopo il push
 
-Output atteso:
-```
-╭─ success ─...
-│  The theme '<NOME TEMA>' (#<THEME_ID>) was pushed successfully.
-```
-
-Se ricevi un errore di validazione Liquid, il file NON è stato pushato. Correggi il Liquid e rilancia. Shopify valida ogni file prima di applicarlo.
+Il tool ritorna esito positivo per ogni asset accettato. Se un asset fallisce la validazione Liquid, quel file NON viene applicato: correggi il Liquid e rilancia la chiamata per quell'asset. Conferma sempre visivamente sull'URL live della PDP.

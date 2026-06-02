@@ -44,7 +44,7 @@ Per default la skill sceglie l'**opzione 2** (più sicuro). L'opzione 1 è dispo
 
 Salva in `templates/index.<store.slug>-home.json`.
 
-Push selettivo standard.
+Push via MCP `mcp__working_suite_shopify_admin__push_theme_asset` con `assets:[{ key, content }]` per chiave esatta (template + sezioni home), `store_id` + `theme_id = main_theme_id`. Retry 429/502/503/504 con backoff 10s/20s/40s (×3); 401/403 → STOP → riconnetti la Custom App. NESSUN comando CLI.
 
 ### 2. Istruzioni utente per assegnare
 
@@ -87,22 +87,35 @@ Solo su esplicita richiesta utente. Step:
 cp <workdir>/templates/index.json <workdir>/templates/index.backup-pre-clone.json
 ```
 
-(Backup locale, non pushato.)
+(Backup locale, non pushato. Se serve la versione live attuale dell'`index.json`, recuperala con un tool Admin-API GET dedicato — NON con la CLI.)
 
-### 2. Sovrascrivi `index.json` con la nuova struttura
+### 2. Conferma esplicita (sovrascrive la home live)
+
+Prima di procedere, conferma con `AskUserQuestion`: "Confermi di sovrascrivere la homepage live? Non è reversibile senza un altro push." Solo dopo il sì, procedi.
+
+### 3. Sovrascrivi `index.json` con la nuova struttura
 
 Stesso JSON dell'opzione 2 ma salvato in `templates/index.json` invece di `index.<store.slug>-home.json`.
 
-### 3. Push selettivo
+### 4. Push via MCP (chiavi esatte: index + sezioni home)
 
-```bash
-npx @shopify/cli@latest theme push \
-  --theme <store.theme_id> --nodelete --allow-live \
-  --only "templates/index.json" \
-  --only "sections/<store-slug>-home-*.liquid"
+```
+mcp__working_suite_shopify_admin__push_theme_asset
+  {
+    store_id: <store.id>,
+    theme_id: <store.theme_id>,            // = main_theme_id da check_connection
+    assets: [
+      { key: "templates/index.json",                       content: "<nuova struttura home>" },
+      { key: "sections/<store-slug>-home-01-<role>.liquid", content: "<liquid>" },
+      { key: "sections/<store-slug>-home-02-<role>.liquid", content: "<liquid>" }
+      // ... una entry per ogni sezione home, chiave ESATTA (mai glob), max 50 per chiamata
+    ]
+  }
 ```
 
-### 4. Conferma utente
+⚠️ Retry su 429/502/503/504 con backoff 10s → 20s → 40s (max 3). Su 401/403 → STOP, riconnetti la Custom App su /configurations/stores.
+
+### 5. Conferma utente
 
 Mostra:
 ```

@@ -64,51 +64,39 @@ Esempi:
 | "no scegli tu"              | "L'utente ha annullato la domanda."             | (nuovo AskUserQuestion con default proposto)                                        |
 | "torna indietro"            | "Operazione interrotta."                        | (nuovo AskUserQuestion con conferma di tornare alla fase precedente)                |
 
-### Push selettivo (template — riusalo)
+### Push asset (MCP — riusalo)
 
-```bash
-cd "$STORE_WORKDIR"
-set -a; source "$STORE_ENV"; set +a
-npx @shopify/cli@latest theme push \
-  --theme "$STORE_THEME_ID" --nodelete --allow-live \
-  --only "<file1>" --only "<file2>" ...
+Tutti i push passano dal tool MCP `mcp__working_suite_shopify_admin__push_theme_asset`. NESSUN Shopify CLI, NESSUN `.env`, NESSUN token in chat.
+
+```
+mcp__working_suite_shopify_admin__push_theme_asset {
+  store_id: <workspace_stores UUID dal contesto di sessione (Fase 1)>,
+  theme_id: <main_theme_id risolto da check_connection in Fase 2>,
+  assets: [
+    { key: "templates/page.<funnel.template_name>.json", content: "<contenuto completo del file>" },
+    { key: "sections/<funnel.prefix><NN>-<role>.liquid",   content: "<contenuto completo del file>" }
+  ]
+}
 ```
 
-Mai senza `--only`. Include SOLO i file del nuovo funnel (template + sezioni col prefisso scelto).
+- **Chiavi esatte** (`sections/...liquid`, `templates/page....json`, `layout/....liquid`), MAI glob, MAI `--only`, MAI `sections/*`.
+- Una chiamata per asset, oppure un array `assets[]` batched (max 50 asset per chiamata).
+- Include SOLO i file del nuovo funnel (template + sezioni col prefisso scelto + eventuale layout chromeless).
+- `content` = contenuto integrale del file generato dalla skill (la skill è la source of truth).
 
-### Errori transitori CLI Shopify (retry obbligatorio)
+### Errori transitori MCP (retry obbligatorio)
 
-Shopify CLI fallisce a volte per cause **transitorie**: `502`, `503`, `504`, `ETIMEDOUT`, `ECONNRESET`, `socket hang up`, `network error`. Non sono errori tuoi.
+`push_theme_asset` può fallire per cause **transitorie**: `429`, `502`, `503`, `504`. Non sono errori tuoi.
 
-**Comportamento richiesto**: fino a **3 tentativi** con backoff esponenziale (10s → 20s → 30s).
-
-Pattern:
-```bash
-for attempt in 1 2 3; do
-  cd "$STORE_WORKDIR"
-  set -a; source "$STORE_ENV"; set +a
-  if npx @shopify/cli@latest theme push --theme "$STORE_THEME_ID" --nodelete --allow-live --only "<file>"; then
-    break
-  fi
-  exit_code=$?
-  if [ $attempt -lt 3 ]; then
-    sleep_secs=$((attempt * 10))
-    echo "Tentativo $attempt fallito, ritento fra ${sleep_secs}s..."
-    sleep $sleep_secs
-  else
-    echo "Push fallito dopo 3 tentativi (exit=$exit_code)"
-    exit $exit_code
-  fi
-done
-```
+**Comportamento richiesto**: fino a **3 tentativi** con backoff esponenziale (10s → 20s → 40s) ri-invocando lo stesso `push_theme_asset` con gli stessi argomenti.
 
 **Quando NON fare retry** (segnala subito all'utente):
-- `401` / `403` / `Invalid API key` → token scaduto. Rimanda a Configurazioni → Store.
-- `Liquid syntax error` → la modifica è rotta. Fixa il file e ripeti.
-- `Theme not found` / `404` su `--theme <id>` → ID tema non esiste più. Ricostruisci la lista temi.
-- `404` su `--only "<file>"` → path file errato. Fixa il path.
+- `401` / `403` → `check_connection` non più valida → STOP, manda l'utente a `/configurations/stores` a (ri)connettere la Custom App. (NON "rigenera token".)
+- `Liquid syntax error` / errore di validazione asset → la modifica è rotta. Fixa il contenuto e ripeti.
+- `Theme not found` / `404` sul `theme_id` → il tema principale non esiste più. Ri-esegui `check_connection` per ottenere il nuovo `main_theme_id`.
+- `404` / chiave non valida sull'asset → `key` errata. Fixa il path esatto.
 
-Stesso retry su `theme pull`. Su `theme list` no retry (errori lì = auth).
+Se i tool `mcp__working_suite_shopify_admin__*` non sono disponibili (mcp=no) → STOP: "MCP non configurato per questa sessione; riapri la chat builder." NON fare fallback a curl/CLI.
 
 ### Regole di intoccabilità
 
@@ -126,10 +114,10 @@ Sotto WSA — riconoscibile da `$WSA_INTERNAL_KEY` valorizzato — il wrapper co
 
 - **cwd**: `~/Desktop/shopify-pdp-builder/`.
 - **`config/stores.json`**: SEMPRE in `./config/stores.json`. Read diretto, niente fallback.
-- **`.env` di ogni store**: già scritto dal wrapper col Theme Access token salvato dall'operatore. **Non chiedere mai il token in chat.**
-- **Stores mancanti**: rimanda l'operatore a Configurazioni → Store nella dashboard, poi ricaricare la chat.
+- **Connessione Shopify**: lo store è già connesso (Custom App, stesso Admin token dell'Analytics), decifrato lato-app dal tool MCP; la skill usa SOLO `store_id` dal contesto di sessione. NESSUN `.env`, NESSUN token Theme Access, NESSUN prompt token in chat.
+- **Stores mancanti / non connessi**: rimanda l'operatore a `/configurations/stores` a (ri)connettere la Custom App, poi ricaricare la chat.
 
-Modalità manuale (no WSA): pattern di onboarding token + `.env` in `references/auth-pattern.md`, sezione "Come generare un nuovo Theme Access token".
+Se i tool `mcp__working_suite_shopify_admin__*` non sono disponibili (mcp=no) → STOP: "MCP non configurato per questa sessione; riapri la chat builder." NON fare fallback a curl/CLI.
 
 ---
 
@@ -139,31 +127,23 @@ Modalità manuale (no WSA): pattern di onboarding token + `.env` in `references/
 
 `Read config/stores.json`. `AskUserQuestion` — una opzione per store, niente "Altro" sotto WSA.
 
-Salva `store.name`, `store.shopify_domain`, `store.theme_id`, `store.workdir_path`, `store.env_path`.
+Salva `store.name`, `store.shopify_domain`, `store.store_id` (l'UUID `workspace_stores` — usato come `store_id` in TUTTE le chiamate MCP), `store.workdir_path`. Il `theme_id` NON si prende qui: arriva da `check_connection` in Fase 2.
 
 ---
 
-## Fase 2 — Verifica auth + scelta tema
+## Fase 2 — Verifica connessione + tema principale
 
 🏷️ Prima riga: `<wsa-phase id="auth-check" />`
 
-1. Verifica `store.env_path` esiste e ha `SHOPIFY_CLI_THEME_TOKEN=` non vuoto. Se vuoto sotto WSA: di' all'utente di aggiungere il token in Configurazioni → Store e ricaricare. Stop.
-2. `theme list`:
-   ```bash
-   cd "<store.workdir_path>"
-   set -a; source "<store.env_path>"; set +a
-   npx @shopify/cli@latest theme list --no-color
-   ```
-   401 / `Invalid API key` → token scaduto, rigenera.
-3. Mostra temi: `[live]` / `[unpublished]` / `[development]` con nome + ID.
-4. `AskUserQuestion`: "Su quale tema operare?" Default `[live]` (o `store.theme_id`).
-5. Salva `store.theme_id` + `store.theme_name`.
-6. **Pull fresco** (chiedi conferma — sovrascrive locali non pushati):
-   ```bash
-   cd "<store.workdir_path>"
-   set -a; source "<store.env_path>"; set +a
-   npx @shopify/cli@latest theme pull --theme <store.theme_id> --nodelete
-   ```
+1. **Guard MCP**: se i tool `mcp__working_suite_shopify_admin__*` non sono disponibili (mcp=no) → STOP: "MCP non configurato per questa sessione; riapri la chat builder." NON fare fallback a curl/CLI.
+2. **Verifica connessione**: chiama `mcp__working_suite_shopify_admin__check_connection` con `{ store_id: <store.store_id> }`.
+   - Se NON connesso → STOP con: "Connessione Shopify Admin non valida per questo store. Vai su /configurations/stores e (ri)connetti la Custom App."
+   - Se la chiamata torna `401` / `403` → STOP, stesso messaggio (manda l'utente a `/configurations/stores` a riconnettere la Custom App). NON parlare di rigenerare token.
+3. **Tema principale**: prendi `main_theme_id` dal RISULTATO di `check_connection` (è il tema pubblicato/live). Salva in `store.theme_id`. Questo valore è il `theme_id` per TUTTI i push successivi. Non esiste più alcun elenco temi.
+   - Se `main_theme_id` è `null` → STOP: "Tema principale non risolto."
+4. Lo store è già connesso (Custom App, stesso Admin token dell'Analytics), decifrato lato-app dal tool MCP; la skill usa SOLO `store_id` dal contesto di sessione. NESSUN `.env`, NESSUN token Theme Access, NESSUN prompt token in chat.
+
+> Gen-2 non scarica una copia di lavoro del tema (niente pull): il contenuto generato dalla skill è la source of truth. Se in futuro servisse leggere un singolo asset esistente, serve un tool Admin-API GET dedicato — NON usare la CLI.
 
 ---
 
@@ -417,9 +397,11 @@ Scrivi in `templates/page.<funnel.template_name>.json`. Le sezioni si aggiungera
 
 Se hai scelto duplicazione (7.1): applica logica di duplicazione (analogo Fase 3 PDP).
 
-### 7.6 Push selettivo del template
+### 7.6 Push del template
 
-Vedi convenzioni — `--only "templates/page.<funnel.template_name>.json"`.
+Vedi convenzioni "Push asset (MCP)". Chiama `mcp__working_suite_shopify_admin__push_theme_asset` con `{ store_id: <store.store_id>, theme_id: <store.theme_id>, assets: [{ key: "templates/page.<funnel.template_name>.json", content: "<contenuto template>" }] }`.
+
+Se hai creato un layout chromeless custom (Fase 7.3), includilo come asset aggiuntivo nello stesso array: `{ key: "layout/<funnel.layout>.liquid", content: "<contenuto layout>" }`.
 
 ### 7.7 Page in Shopify Admin
 
@@ -515,7 +497,7 @@ Per ogni `sections/<funnel.prefix><NN>-<role>.liquid`:
 Loop 01→N:
 
 1. `Write` del file `.liquid` + `Edit`/`Read+Write` del template JSON.
-2. Push selettivo (sezione + template).
+2. Push via `push_theme_asset` (vedi convenzioni): un'unica chiamata con `assets: [{ key: "sections/<file>.liquid", content }, { key: "templates/page.<funnel.template_name>.json", content }]`.
 3. Utente verifica `https://<store.shopify_domain>/pages/<funnel.page_slug>` mobile + desktop.
 4. Aggiustamenti minimi in loop fino a conferma.
 5. Prima della prossima: `AskUserQuestion` "Continua sezione-per-sezione, passa a batch, o misto?" Rispetta la scelta.
@@ -526,15 +508,15 @@ Loop 01→N:
 2. Scrivi il template JSON definitivo con tutte le sezioni ordinate.
 3. **Diff-preview** testuale: struttura + headline + primo paragrafo per sezione (no dump markup intero).
 4. Approvazione globale o correzioni puntuali.
-5. Push selettivo unico (template + tutte le sezioni).
+5. Push unico via `push_theme_asset`: un solo `assets[]` con il template + tutte le sezioni (max 50 asset/chiamata; se di più, spezza in batch).
 6. Utente verifica live.
 7. Aggiustamenti successivi → modalità sezione-per-sezione per i fix.
 
 ### 8.5 Workflow C — misto leggero
 
 1. Sezioni "complesse" (hero, problem, solution, proof, cta-offer, quiz-wrapper, result) → workflow A.
-2. Sezioni "semplici" (announcement, trust, faq, footer, disclaimer) → batch, push unico intermedio senza conferma individuale.
-3. A fine fase: pull completo, utente verifica tutto insieme.
+2. Sezioni "semplici" (announcement, trust, faq, footer, disclaimer) → batch, push unico intermedio via `push_theme_asset` (un solo `assets[]`) senza conferma individuale.
+3. A fine fase: utente verifica tutto insieme sull'URL live (niente pull — il contenuto generato dalla skill è la source of truth).
 
 ### 8.6 Verifica no-regressioni
 
@@ -562,7 +544,7 @@ Per ogni sezione con `image_picker`:
    ```
 3. Istruzioni:
    ```
-   1. Admin → Online Store → Themes → Customize (<store.theme_name>)
+   1. Admin → Online Store → Themes → Customize (tema live/pubblicato)
    2. Top-left → Pages → <titolo pagina>
    3. Sidebar sezioni → <prefix>-<NN>-<role>
    4. Per ogni campo immagine: click → Select image → Upload → Save
@@ -650,14 +632,13 @@ Al resume (`claude --resume <id>`):
 1. Chiedi all'operatore cosa esattamente cambiare (e in quale sezione se non chiaro).
 2. `grep` mirato per localizzare la modifica — non rifare l'inventario sezioni come in Fase 8.
 3. `Edit` o `python3 heredoc` puntuale sul singolo file.
-4. Push selettivo (solo il file toccato).
+4. Push del solo file toccato via `push_theme_asset` (`assets: [{ key, content }]`, store_id + theme_id dal contesto). Riconferma `check_connection` se la sessione è vecchia e dubiti che lo store sia ancora connesso.
 5. Verifica URL live.
 6. `AskUserQuestion` "Altre modifiche?" → loop o chiudi.
 
 **Cosa NON fare:**
 
 - Non ripercorrere fasi 1-9 (brand, tipo funnel, struttura, prodotto/angle, template, sezioni — tutto già in memoria via `--resume`).
-- Non rifare `theme pull` se non c'è una ragione concreta.
 - Non riproporre modalità A/B/C — per un fix singolo si fa puntuale.
 - Non emettere nuovi tag `<wsa-phase>` per fasi già fatte.
 
@@ -686,8 +667,8 @@ Reference: `references/analytics-instrumentation.md` (event catalog completo, pa
 
 ## References
 
-- `auth-pattern.md` — `.env`, Theme Access token, modalità manuale
-- `selective-push.md` — comando push completo
+- `auth-pattern.md` — [OBSOLETO Gen-1] sostituito dai tool MCP `check_connection` + `push_theme_asset`
+- `selective-push.md` — push asset via MCP `push_theme_asset` (chiavi esatte, batch, retry)
 - `section-naming.md` — convenzioni prefissi (PDP + funnel)
 - `funnel-types.md` — struttura advertorial / listicle / quiz / other
 - `brand-identity-discovery.md` — palette + tipografia da PDP esistente
@@ -704,5 +685,8 @@ Reference: `references/analytics-instrumentation.md` (event catalog completo, pa
 | Bottoni non portano al prodotto        | `href` vuoto o `#` in qualche sezione          | Grep `href="` nelle sezioni, tutti = `funnel.cta_url`|
 | Font incoerente col resto del sito     | `brand.*` non applicato a tutte le sezioni    | Ri-scansiona, applica `font-family: <brand.*>`       |
 | Sezione invisibile live                | Non aggiunta all'`order` del template JSON     | Verifica array `order`                               |
-| Push fallisce "Liquid syntax"          | Schema malformato, brace unmatched             | Leggi error line, `Edit` puntuale                    |
+| `push_theme_asset` 401/403             | `check_connection` non più valida              | STOP, manda l'utente a /configurations/stores a riconnettere la Custom App |
+| `push_theme_asset` "Liquid syntax"     | Schema malformato, brace unmatched             | Leggi error line, `Edit` puntuale, re-push           |
+| `push_theme_asset` 429/502/503/504     | Errore transitorio                             | Retry stesso push con backoff 10s/20s/40s (3 tentativi) |
+| Tool `mcp__working_suite_shopify_admin__*` assenti | MCP non configurato per la sessione | STOP, riapri la chat builder. NO fallback CLI/curl   |
 | Mobile text overflow                   | Font-size in px anziché clamp                  | `clamp(1rem, 4vw, 1.5rem)` o media query             |

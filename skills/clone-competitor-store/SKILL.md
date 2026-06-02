@@ -31,7 +31,9 @@ Segui le 8 fasi **in sequenza**. Non saltare fasi. Usa `AskUserQuestion` come ga
 - **🔁 Workflow testi INVARIANTE per ogni tipo di pagina**: il modo di raccogliere e applicare i testi è IDENTICO per funnel, PDP, home, extras. L'utente fornisce HTML salvato (o copy/paste) → la skill mette i testi letterali nei `default` dello schema. **NIENTE asimmetrie** tra tipi di pagina. Le differenze tra tipi riguardano la STRUTTURA (PDP main custom, batch 1+batch 2, home assignment, funnel layout chromeless) — NON il modo di trattare i testi.
 - **⭐ Sezioni reviews: replica esattamente quello che il competitor ha**: niente più, niente meno. Alcuni competitor hanno solo carousel testimonial, alcuni solo grid con breakdown, alcuni entrambe in posizioni separate, alcuni nessuna sezione dedicata (solo star rating accanto al titolo via app), alcuni testimonial integrati in altre sezioni. **Non aggiungere una carousel "perché è il pattern tipico"** se il competitor non ce l'ha. **Non rimuovere una grid** se invece c'è. Identifica le sezioni reviews effettivamente presenti negli screenshot e replica solo quelle. Vedi `references/pdp-main-configuration.md` sezione "Sezioni reviews" per i pattern di riferimento.
 - **Mobile-first**: il traffico arriva da ads (>80% mobile). Ogni sezione deve girare benissimo a 375px.
-- **Un push per volta, sempre selettivo**. Mai `theme push` senza `--only`. Il `--only` include SOLO i file della pagina corrente.
+- **Un asset per chiamata (o batch espliciti), sempre per chiave esatta**. Ogni push avviene via il tool MCP `mcp__working_suite_shopify_admin__push_theme_asset`, passando `assets: [{ key, content }]` con la **chiave esatta** del file (es. `sections/<prefix>-02-hero.liquid`, `templates/page.<slug>.json`). MAI glob/wildcard nelle chiavi. Una chiamata per asset, oppure un array `assets[]` batchato (max 50 asset per chiamata). Include SOLO i file della pagina corrente.
+- **Auth Gen-2 (Custom App, niente CLI/Theme Access)**: lo store è già connesso (Custom App, stesso Admin token dell'Analytics), decifrato lato-app dal tool MCP; la skill usa SOLO `store_id` dal contesto di sessione. NESSUN `.env`, NESSUN token Theme Access, NESSUN prompt token in chat.
+- **MCP guard**: se i tool `mcp__working_suite_shopify_admin__*` non sono disponibili (mcp=no) → STOP: "MCP non configurato per questa sessione; riapri la chat builder." NON fare fallback a curl/CLI.
 - **Conferma prima di azioni irreversibili** (creazione file, push live, override homepage).
 
 ## Lettura dello stato iniziale
@@ -71,33 +73,36 @@ Comportamento:
 
 Mostra all'utente la lista degli store configurati. Usa `AskUserQuestion` con un'opzione per store + "Altro".
 
-Se "Altro": chiedi nome, `shopify_domain` (*.myshopify.com), theme ID, path workdir, path env. Aggiungi voce a `stores.json`.
+Se "Altro": chiedi nome, `shopify_domain` (*.myshopify.com), path workdir. Aggiungi voce a `stores.json`. **NON** chiedere theme ID né path env: il theme id arriva da `check_connection` (Fase 2) e l'auth è gestita dalla Custom App via MCP.
 
-Salva in memoria: `store.name`, `store.shopify_domain`, `store.theme_id`, `store.workdir_path`, `store.env_path`.
+Salva in memoria: `store.name`, `store.shopify_domain`, `store.workdir_path`, e — soprattutto — `store.id` (lo **UUID di `workspace_stores`** preso dal contesto di sessione del builder). `store.id` è l'unico identificatore che la skill passa ai tool MCP. Se manca dal contesto → STOP: "store_id assente dal contesto di sessione; riapri la chat builder dallo store giusto."
 
 **Genera lo slug store** (kebab-case del nome, es. `Glowria` → `glowria`, `Nimea Beauty` → `nimea`). Salva in `store.slug`. Sarà il prefisso di tutte le sezioni e i template creati dalla skill.
 
 ---
 
-## Fase 2 — Verifica auth + scelta tema
+## Fase 2 — Verifica connessione Shopify Admin (MCP) + risoluzione tema
 
-Identica a `/create-new-funnel` Fase 2.
+Gen-2: niente CLI, niente `.env`, niente Theme Access. La connessione è una Custom App (stesso Admin token dell'Analytics) decifrata lato-app dal tool MCP. La skill verifica la connessione e ricava il tema principale in **una sola chiamata MCP**.
 
-1. Se `store.env_path` non esiste → guida alla creazione (`shptka_*` token). Fonte: `../create-new-pdp/references/auth-pattern.md`.
-2. Lancia:
-   ```bash
-   cd "<store.workdir_path>"
-   set -a; source "<store.env_path>"; set +a
-   npx @shopify/cli@latest theme list --no-color
+1. **Guard MCP**: se i tool `mcp__working_suite_shopify_admin__*` non sono disponibili → STOP: "MCP non configurato per questa sessione; riapri la chat builder." NON fare fallback a curl/CLI.
+2. **Verifica connessione**: chiama il tool MCP
+
    ```
-3. Se 401: token scaduto, utente rigenera e riprova.
-4. Mostra i temi parsati.
-5. `AskUserQuestion`: "Su quale tema operare?" Default: `[live]` o `store.theme_id` del config.
-6. Salva in `store.theme_id` + `store.theme_name`.
-7. **Pull fresco** del tema scelto (chiedi conferma — sovrascrive locale non pushato):
-   ```bash
-   npx @shopify/cli@latest theme pull --theme <store.theme_id> --nodelete
+   mcp__working_suite_shopify_admin__check_connection
+     { store_id: <store.id> }   // l'UUID di workspace_stores salvato in Fase 1
    ```
+
+3. **Se NON connesso** (campo `connected: false`, oppure errore 401/403) → STOP con il messaggio esatto:
+   > "Connessione Shopify Admin non valida per questo store. Vai su /configurations/stores e (ri)connetti la Custom App."
+
+   NON suggerire mai "rigenera token", NON leggere alcun file di auth CLI.
+4. **Risoluzione tema (NIENTE `theme list`)**: il tema su cui operare è il **tema pubblicato/live**, che arriva dal campo del risultato `main_theme_id` di `check_connection`. Salva:
+   - `store.theme_id = <result.main_theme_id>`
+   - `store.theme_name = <result.main_theme_name>` (se presente nel risultato)
+
+   Se `main_theme_id` è `null` → STOP: "Tema principale non risolto per questo store."
+5. Non c'è alcun **pull**: Gen-2 non scarica una working copy del tema. I contenuti generati dalla skill (file `.liquid` + `templates/*.json` che scrivi in locale nel workdir) sono la **fonte di verità** e vengono spinti sul tema con `push_theme_asset`. Se un singolo asset esistente dovesse essere letto, servirebbe un tool Admin-API GET dedicato — NON usare la CLI.
 
 ---
 
@@ -455,31 +460,17 @@ ls sections/<current_page.section_prefix>-*.liquid 2>/dev/null
 
 Se almeno UNO dei due comandi trova qualcosa → c'è collisione. **Non procedere** alla creazione. `AskUserQuestion`:
 
-- **(a) Cleanup totale + ripartiamo da zero (Recommended)**
-  - Cancello tutti i file vecchi (template + sezioni con prefisso) sia in locale che dal tema live
-  - Procedo a 6.x.3.b con workspace pulito
-  - Comando di cancellazione (mostra all'utente cosa farai prima di lanciarlo):
-    ```bash
-    cd "<store.workdir_path>"
-    rm -f sections/<prefix>-*.liquid templates/<template-target>.json
-    env $(grep -v '^#' "<store.env_path>" | xargs) \
-      npx -y @shopify/cli@latest theme push \
-      --theme <store.theme_id> --allow-live \
-      --only "sections/<prefix>-*.liquid" \
-      --only "templates/<template-target>.json"
-    ```
-    (NB: senza `--nodelete` → il push sync solo i file matching i pattern `--only` e cancella dal remoto quelli orfani che corrispondono al pattern.)
+- **(a) Cambia slug → versione `-v2` (Recommended in Gen-2)** → riusa lo stesso approccio dei nomi ma con suffix versione:
+  - `target_slug = <slug>-v2` → template `<store.slug>-pdp-v2`, prefisso sezioni `<store.slug>-pdp-v2-` (incrementa il numero se `-v2` già esiste: `-v3`, ecc.)
+  - Procedi a 6.x.3.b coi nomi nuovi (chiavi asset nuove → nessun overwrite del lavoro precedente)
+  - I file vecchi restano intatti sia in locale che sul tema live (l'utente può cancellarli a mano dopo dal theme editor / file manager se vuole)
+  - ⚠️ **Perché in Gen-2 il default è "Cambia slug" e non un cleanup**: `push_theme_asset` (MCP) **scrive/aggiorna** asset per chiave, ma **non cancella** asset remoti. Non esiste (ancora) un tool `delete-theme-asset`. Quindi sovrascrivere lo stesso prefisso lascia comunque eventuali orfani vecchi sul tema. Cambiare slug evita del tutto il problema delle chiavi orfane.
 
-- **(b) Suffix versione `-v2`** → riusa lo stesso approccio dei nomi ma con suffix:
-  - `<store-slug>-pdp-v2`, prefisso sezioni `<store-slug>-pdp-v2-` (incrementa il numero se v2 già esiste)
-  - Procedi a 6.x.3.b coi nomi nuovi
-  - I file vecchi restano intatti (l'utente può cancellarli a mano dopo se vuole)
+- **(b) Stop e usa il vecchio** → la skill termina, l'utente lavora sul template esistente con le altre skill (`/create-new-pdp` per editing, theme editor per modifiche dirette)
 
-- **(c) Stop e usa il vecchio** → la skill termina, l'utente lavora sul template esistente con le altre skill (`/create-new-pdp` per editing, theme editor per modifiche dirette)
+⚠️ Se l'utente dice "vai avanti, sovrascrivi" senza scegliere una delle opzioni: rifiuta. Spiega che sovrascrivere lo stesso prefisso in Gen-2 **non cancella** le sezioni vecchie dal tema (`push_theme_asset` non elimina asset) → restano file orfani che confondono il theme editor. Insisti su "Cambia slug" o "Stop".
 
-⚠️ Se l'utente dice "vai avanti, sovrascrivi" senza scegliere una delle opzioni: rifiuta. Spiega che sovrascrivere il template senza cancellare le sezioni vecchie crea il problema dei file orfani. Insisti su una delle 3 opzioni.
-
-⚠️ **Se l'utente sceglie (a) Cleanup**: PRIMA cancella, POI verifica con un nuovo `ls` che il workspace sia effettivamente pulito, POI procedi. Non saltare la verifica — anche un singolo file orfano residuo crea il bug del run-precedente che rispunta.
+> **Nota orphan cleanup (Gen-2 gap noto)**: la cancellazione di asset orfani dal tema live richiederebbe un futuro tool `mcp__working_suite_shopify_admin__delete_theme_asset` (Admin API `themeFilesDelete`). Finché non esiste, la strategia anti-orfani è **non riusare lo stesso slug** (opzione a). Non tentare cancellazioni via CLI.
 
 #### 6.x.3.b — Creazione template scheletro
 
@@ -503,14 +494,19 @@ Scrivi `templates/<file>.json` con scheletro:
 
 (Il layout key va omesso se è quello di default per il tipo template.)
 
-Push selettivo dello scheletro vuoto:
-```bash
-cd "<store.workdir_path>"
-set -a; source "<store.env_path>"; set +a
-npx @shopify/cli@latest theme push \
-  --theme <store.theme_id> --nodelete --allow-live \
-  --only "templates/<file>.json"
+Push dello scheletro vuoto via MCP (una chiamata, chiave esatta del template):
 ```
+mcp__working_suite_shopify_admin__push_theme_asset
+  {
+    store_id: <store.id>,
+    theme_id: <store.theme_id>,          // = main_theme_id da check_connection (Fase 2)
+    assets: [
+      { key: "templates/<file>.json", content: "<contenuto JSON completo del template scheletro>" }
+    ]
+  }
+```
+
+⚠️ **Retry su ogni `push_theme_asset`**: in caso di errore transitorio (HTTP 429/502/503/504) ritenta con backoff 10s → 20s → 40s (max 3 tentativi). Su 401/403 → la connessione è caduta: NON ritentare, STOP e manda l'utente a /configurations/stores a riconnettere la Custom App.
 
 ### 6.x.4 — Scelta modalità di costruzione sezioni
 
@@ -997,22 +993,43 @@ E aggiungi la chiave all'array `order` nella posizione corretta.
 
 ##### Modalità A (one-shot)
 
-Scrivi tutti i file `.liquid` in parallelo (multiple `Write` in un singolo messaggio). Aggiorna il template JSON con tutte le sezioni in `sections{}` + `order[]`. Push selettivo unico:
+Scrivi tutti i file `.liquid` in parallelo (multiple `Write` in un singolo messaggio). Aggiorna il template JSON con tutte le sezioni in `sections{}` + `order[]`. Poi un solo push MCP batchato con tutte le chiavi esatte (template + ogni sezione):
 
-```bash
-cd "<store.workdir_path>"
-set -a; source "<store.env_path>"; set +a
-npx @shopify/cli@latest theme push \
-  --theme <store.theme_id> --nodelete --allow-live \
-  --only "templates/<file>.json" \
-  --only "sections/<prefix>-01-<role>.liquid" \
-  --only "sections/<prefix>-02-<role>.liquid" \
-  # ... tutte le sezioni
 ```
+mcp__working_suite_shopify_admin__push_theme_asset
+  {
+    store_id: <store.id>,
+    theme_id: <store.theme_id>,           // = main_theme_id da check_connection
+    assets: [
+      { key: "templates/<file>.json",                content: "<contenuto JSON completo del template>" },
+      { key: "sections/<prefix>-01-<role>.liquid",   content: "<contenuto liquid completo>" },
+      { key: "sections/<prefix>-02-<role>.liquid",   content: "<contenuto liquid completo>" }
+      // ... una entry per ogni sezione, chiave ESATTA (mai glob), max 50 asset per chiamata
+    ]
+  }
+```
+
+⚠️ **Batch > 50 asset**: se la pagina ha più di 50 asset (raro), spezza in più chiamate `push_theme_asset` da ≤50 ciascuna.
+
+⚠️ **Retry obbligatorio su OGNI chiamata `push_theme_asset`** (clone = molti push in loop, alto rischio rate-limit): su 429/502/503/504 ritenta con backoff 10s → 20s → 40s (max 3 tentativi). Su 401/403 → STOP, manda l'utente a /configurations/stores a riconnettere la Custom App (NON "rigenera token", NON CLI).
 
 ##### Modalità B (sezione per sezione)
 
-Loop: per ogni sezione, write file → aggiorna template JSON → push selettivo (solo questa sezione + template) → utente verifica live → conferma → prossima sezione.
+Loop: per ogni sezione, write file → aggiorna template JSON → push MCP della singola sezione + template → utente verifica live → conferma → prossima sezione.
+
+Per ogni iterazione, una chiamata MCP con 2 asset (sezione corrente + template aggiornato):
+```
+mcp__working_suite_shopify_admin__push_theme_asset
+  {
+    store_id: <store.id>,
+    theme_id: <store.theme_id>,
+    assets: [
+      { key: "sections/<prefix>-<NN>-<role>.liquid", content: "<contenuto liquid>" },
+      { key: "templates/<file>.json",                content: "<template aggiornato con la sezione>" }
+    ]
+  }
+```
+(Stesso retry/backoff e gestione 401/403 della Modalità A — applicalo a OGNI push del loop.)
 
 A ogni conferma di sezione, prima di passare alla successiva, `AskUserQuestion`: "Confermata. Continua sezione-per-sezione, o passo al one-shot per le restanti N?"
 
@@ -1108,18 +1125,23 @@ cta_label
 
 #### 6.x.6.b — Push translation
 
-Modalità batch:
-```bash
-cd "<store.workdir_path>"
-set -a; source "<store.env_path>"; set +a
-npx @shopify/cli@latest theme push \
-  --theme <store.theme_id> --nodelete --allow-live \
-  --only "sections/<prefix>-01-<role>.liquid" \
-  --only "sections/<prefix>-02-<role>.liquid" \
-  # ... tutte le sezioni tradotte
+Un solo push MCP batchato con le sole sezioni tradotte (chiavi esatte, niente glob):
+```
+mcp__working_suite_shopify_admin__push_theme_asset
+  {
+    store_id: <store.id>,
+    theme_id: <store.theme_id>,            // = main_theme_id da check_connection
+    assets: [
+      { key: "sections/<prefix>-01-<role>.liquid", content: "<liquid con default tradotti IT>" },
+      { key: "sections/<prefix>-02-<role>.liquid", content: "<liquid con default tradotti IT>" }
+      // ... una entry per ogni sezione tradotta (max 50 per chiamata)
+    ]
+  }
 ```
 
-Niente push del template `.json` (lo schema dei file è cambiato dentro i `.liquid`, ma la struttura del template JSON resta identica).
+Niente push del template `.json` (i `default` cambiano dentro i `.liquid`, ma la struttura del template JSON resta identica).
+
+⚠️ Stesso retry/backoff su OGNI push (429/502/503/504 → 10s/20s/40s, max 3). 401/403 → STOP → riconnetti la Custom App su /configurations/stores.
 
 #### 6.x.6.c — Verifica final IT
 
@@ -1194,12 +1216,30 @@ OPZIONE A (Recommended) — assegna come homepage:
   4. Save.
 
 OPZIONE B — sostituisci direttamente l'index.json di default:
-  Te lo posso fare io con un push che sovrascrive `templates/index.json`.
-  Più semplice ma non reversibile senza altro push.
+  Te lo posso fare io con un push MCP che sovrascrive `templates/index.json`.
+  Più semplice ma SOVRASCRIVE LA HOME LIVE e non è reversibile senza un altro push.
   Conferma se vuoi questa strada.
 ```
 
-`AskUserQuestion` per scegliere. Se OPZIONE B → push selettivo con override di `templates/index.json` previo backup locale.
+`AskUserQuestion` per scegliere.
+
+⚠️ **OPZIONE B sovrascrive la home live**: prima di pushare `templates/index.json`, conferma esplicitamente con un secondo `AskUserQuestion` ("Confermi di sovrascrivere la homepage live? L'azione non è reversibile senza un altro push."). Salva una copia locale del vecchio `templates/index.json` come backup (es. `templates/index.backup-pre-clone.json`) PRIMA di sovrascrivere.
+
+Solo dopo la conferma, push MCP (chiavi esatte: l'index + tutte le sezioni home):
+```
+mcp__working_suite_shopify_admin__push_theme_asset
+  {
+    store_id: <store.id>,
+    theme_id: <store.theme_id>,            // = main_theme_id da check_connection
+    assets: [
+      { key: "templates/index.json",                     content: "<nuova struttura home>" },
+      { key: "sections/<store.slug>-home-01-<role>.liquid", content: "<liquid>" },
+      { key: "sections/<store.slug>-home-02-<role>.liquid", content: "<liquid>" }
+      // ... una entry per ogni sezione home, chiave esatta, max 50 per chiamata
+    ]
+  }
+```
+(Retry 429/502/503/504 → 10s/20s/40s ×3; 401/403 → STOP → riconnetti Custom App.) Vedi `references/home-template.md`.
 
 #### Se la pagina è un Extra (contattaci, traccia ordine, FAQ, about, blog, collection)
 
@@ -1276,14 +1316,19 @@ Se chiudi: dichiara il clone pronto.
 
 | Sintomo                                         | Causa                                              | Fix                                                                  |
 |-------------------------------------------------|----------------------------------------------------|----------------------------------------------------------------------|
-| `theme list` ritorna 401                        | Token Theme Access scaduto                         | Rigenera `shptka_*` da app Theme Access, aggiorna `.env`             |
-| Push fallisce con "Liquid syntax error"         | Schema malformato                                  | Leggi error line, `Edit` puntuale del file, ri-push                  |
+| `check_connection` ritorna `connected: false` / 401 / 403 | Custom App non collegata o token Admin non valido per questo store | STOP. Manda l'utente su /configurations/stores a (ri)connettere la Custom App. NON "rigenera token", NON CLI |
+| `push_theme_asset` ritorna 401 / 403            | La connessione è caduta a metà sessione            | STOP, riconnetti la Custom App su /configurations/stores, poi riprova il push |
+| `push_theme_asset` ritorna 429 / 502 / 503 / 504 | Rate-limit o errore transitorio Admin API          | Retry con backoff 10s → 20s → 40s (max 3 tentativi). Se persiste, riprova più tardi |
+| Tool `mcp__working_suite_shopify_admin__*` assenti | MCP non configurato per la sessione                | STOP: "MCP non configurato per questa sessione; riapri la chat builder." NIENTE fallback CLI/curl |
+| `check_connection` ritorna `main_theme_id: null` | Tema principale non risolto                         | STOP: "Tema principale non risolto per questo store." |
+| `push_theme_asset` fallisce con "Liquid syntax error" | Schema malformato                                  | Leggi error line, `Edit` puntuale del file, ri-pusha l'asset        |
 | WebFetch del competitor restituisce vuoto       | JS-rendered content / paywall                      | Chiedi all'utente screenshot full-page + URL, lavora dagli screenshot |
 | Brand discovery estrae colori sbagliati         | CSS dinamico / dark mode default                   | Mostra colori estratti, lascia override utente in 4.3                 |
 | PDP non mostra app blocks editabili             | Schema sezione manca `{"type": "@app"}` nei blocks | Edit schema, riaggiungi `@app`, ripusha sezione                      |
 | Home non si vede sul dominio                    | Template non assegnato come homepage in Theme settings | Admin → Online Store → Themes → Customize → assegna template       |
 | CTA del funnel puntano a `#`                    | PDP creata DOPO il funnel (ordine sbagliato)        | Edit setting `cta_url` di tutte le sezioni funnel, sostituisci URL PDP |
 | Mobile text overflow                            | Font-size fissi in px                              | Sostituisci con `clamp(1rem, 4vw, 1.5rem)` o media query             |
+| Sezioni orfane sul tema dopo riuso slug         | `push_theme_asset` non cancella asset; slug riusato | Cambia slug (`-v2`); orphan cleanup richiede un futuro tool `delete_theme_asset` |
 
 ---
 
@@ -1300,11 +1345,14 @@ Se chiudi: dichiara il clone pronto.
 - `home-template.md` — gestione `index.<slug>.json` + assignment manuale come homepage
 - `page-types-extras.md` — template per contattaci, traccia ordine, FAQ, about, blog, collection
 
-### Riusati dalle skill esistenti (path relativo)
+### Auth + push (Gen-2, MCP — NO file CLI)
 
-- `../create-new-pdp/references/auth-pattern.md` — `.env`, Theme Access token, verifica connessione
+- Auth: tool MCP `mcp__working_suite_shopify_admin__check_connection { store_id }` → restituisce `connected` + `main_theme_id`. NESSUN file di auth CLI, NESSUN Theme Access token. (NON leggere mai `../create-new-pdp/references/auth-pattern.md`: è il pattern CLI Gen-1, obsoleto.)
+- Push: tool MCP `mcp__working_suite_shopify_admin__push_theme_asset { store_id, theme_id, assets:[{key,content}] }` → una chiave esatta per asset (max 50/chiamata), retry 429/502/503/504 con backoff 10s/20s/40s. (NON usare comandi `theme push` CLI.)
+
+### Riusati dalle skill esistenti (path relativo, solo convenzioni — NON auth/push)
+
 - `../create-new-pdp/references/section-naming.md` — convenzioni prefissi e naming sezioni
-- `../create-new-pdp/references/selective-push.md` — comando push selettivo standard
 - `../create-new-pdp/references/section-schema-patterns.md` — pattern schema editabile
 - `../create-new-funnel/references/brand-identity-discovery.md` — base per `competitor-discovery.md` (estesa)
 - `../create-new-funnel/references/funnel-types.md` — strutture base advertorial/listicle/quiz

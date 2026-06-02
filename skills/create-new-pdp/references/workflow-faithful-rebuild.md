@@ -69,5 +69,5 @@ c = pattern.sub(new_array_literal, c, count=1)
 
 1. Conferma che il count dei replace sia quello atteso (tipicamente 1 per testo).
 2. Apri il file modificato con `Read` e controlla che struttura/indentazione siano intatte.
-3. Push selettivo `--only sections/<file>.liquid`.
+3. Push selettivo via `push_theme_asset` (MCP) della sola `key` `sections/<file>.liquid` con il contenuto completo del file (vedi `selective-push.md`).
 4. Chiedi all'utente conferma visiva sulla PDP live prima di passare alla sezione successiva.
